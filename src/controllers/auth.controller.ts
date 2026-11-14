@@ -5,7 +5,7 @@ import { registerSchema, loginSchema } from "../schemas/auth.schema.js";
 import { Prisma } from "../generated/prisma/client.js";
 
 import jwt from "jsonwebtoken";
-import { loginSchema } from "../schemas/auth.schema.js";
+
 
 
 export const registerUser = async (req: Request, res: Response) => {

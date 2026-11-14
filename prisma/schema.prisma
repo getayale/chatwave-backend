@@ -7,6 +7,11 @@ datasource db {
   provider = "postgresql"
 }
 
+enum ProfileVisibility {
+  PUBLIC
+  PRIVATE
+}
+
 model User {
   id           String  @id @default(cuid())
   username     String  @unique
@@ -16,12 +21,15 @@ model User {
   bio          String?
   avatarUrl    String?
 
+  profileVisibility ProfileVisibility @default(PRIVATE)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   conversations ConversationParticipant[]
   messages      Message[]
   messageReads  MessageRead[]
+  profilePhotos ProfilePhoto[]
 }
 
 model Conversation {
@@ -75,4 +83,17 @@ model MessageRead {
 
   @@unique([messageId, userId])
   @@index([userId])
+}
+
+
+model ProfilePhoto {
+  id         String   @id @default(cuid())
+  imageUrl   String
+  storageKey String
+  userId     String
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
 }
