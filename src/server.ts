@@ -7,6 +7,11 @@ import jwt from "jsonwebtoken";
 import app from "./app.js";
 import prisma from "./config/prisma.js";
 import { initializeSocket } from "./config/socket.js";
+import {
+  addUserConnection,
+  removeUserConnection,
+  getOnlineUsers,
+} from "./config/presence.js";
 
 const PORT = 3000;
 
@@ -29,9 +34,6 @@ const io = new Server(httpServer, {
 
 // Make Socket.IO available to controllers
 initializeSocket(io);
-
-// Track active socket connections for each user
-const connectedUsers = new Map<string, Set<string>>();
 
 // 3. Authenticate Socket.IO connections
 io.use((socket, next) => {
@@ -73,14 +75,7 @@ io.on("connection", (socket) => {
   console.log(`User connected: ${userId}`);
 
   // Track this user's socket connection
-  const userSockets =
-    connectedUsers.get(userId) ?? new Set<string>();
-
-  const wasOffline = userSockets.size === 0;
-
-  userSockets.add(socket.id);
-
-  connectedUsers.set(userId, userSockets);
+  const wasOffline = addUserConnection(userId, socket.id);
 
   // Broadcast online status only when the user first connects
   if (wasOffline) {
@@ -91,7 +86,7 @@ io.on("connection", (socket) => {
 
   // Send current online users to this connection
   socket.emit("presence:online-users", {
-    userIds: Array.from(connectedUsers.keys()),
+    userIds: getOnlineUsers(),
   });
 
   // Join private user room
@@ -202,20 +197,13 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     console.log(`User disconnected: ${userId}`);
 
-    // Get this user's active connections
-    const userSockets = connectedUsers.get(userId);
+    const becameOffline = removeUserConnection(
+      userId,
+      socket.id,
+    );
 
-    if (!userSockets) {
-      return;
-    }
-
-    // Remove the disconnected socket
-    userSockets.delete(socket.id);
-
-    // Mark offline only when no connections remain
-    if (userSockets.size === 0) {
-      connectedUsers.delete(userId);
-
+    // Broadcast offline status only when all connections are closed
+    if (becameOffline) {
       socket.broadcast.emit("presence:offline", {
         userId,
       });

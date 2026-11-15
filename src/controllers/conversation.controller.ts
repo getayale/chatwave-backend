@@ -2,10 +2,32 @@
 import type { Request, Response } from "express";
 import prisma from "../config/prisma.js";
 import { createConversationSchema } from "../schemas/conversation.schema.js";
+import { isUserOnline } from "../config/presence.js";
 
-export const createConversation = async (req: Request, res: Response) => {
+const addOnlineStatus = <
+  T extends { participants: Array<{ user: { id: string } }> },
+>(
+  conversation: T,
+) => {
+  return {
+    ...conversation,
+    participants: conversation.participants.map(
+      (participant) => ({
+        ...participant,
+        user: {
+          ...participant.user,
+          isOnline: isUserOnline(participant.user.id),
+        },
+      }),
+    ),
+  };
+};
+
+export const createConversation = async (
+  req: Request,
+  res: Response,
+) => {
   try {
-    // 1. Validate incoming data
     const result = createConversationSchema.safeParse(req.body);
 
     if (!result.success) {
@@ -15,7 +37,6 @@ export const createConversation = async (req: Request, res: Response) => {
       });
     }
 
-    // 2. Get the logged-in user and the other participant
     const userId = req.user?.userId;
     const { participantId } = result.data;
 
@@ -25,14 +46,12 @@ export const createConversation = async (req: Request, res: Response) => {
       });
     }
 
-    // 3. Prevent users from creating conversations with themselves
     if (userId === participantId) {
       return res.status(400).json({
         message: "You cannot create a conversation with yourself",
       });
     }
 
-    // 4. Check whether the other user exists
     const participant = await prisma.user.findUnique({
       where: { id: participantId },
       select: { id: true },
@@ -44,7 +63,6 @@ export const createConversation = async (req: Request, res: Response) => {
       });
     }
 
-    // 5. Find an existing conversation between both users
     const existingConversation = await prisma.conversation.findFirst({
       where: {
         AND: [
@@ -71,11 +89,10 @@ export const createConversation = async (req: Request, res: Response) => {
     if (existingConversation) {
       return res.status(200).json({
         message: "Conversation already exists",
-        conversation: existingConversation,
+        conversation: addOnlineStatus(existingConversation),
       });
     }
 
-    // 6. Create a new conversation
     const conversation = await prisma.conversation.create({
       data: {
         participants: {
@@ -103,7 +120,7 @@ export const createConversation = async (req: Request, res: Response) => {
 
     return res.status(201).json({
       message: "Conversation created successfully",
-      conversation,
+      conversation: addOnlineStatus(conversation),
     });
   } catch (error) {
     console.error("Create conversation error:", error);
@@ -114,12 +131,11 @@ export const createConversation = async (req: Request, res: Response) => {
   }
 };
 
-
-
-
-export const getConversations = async (req: Request, res: Response) => {
+export const getConversations = async (
+  req: Request,
+  res: Response,
+) => {
   try {
-    // 1. Get the logged-in user
     const userId = req.user?.userId;
 
     if (!userId) {
@@ -128,7 +144,6 @@ export const getConversations = async (req: Request, res: Response) => {
       });
     }
 
-    // 2. Retrieve conversations belonging to this user
     const conversations = await prisma.conversation.findMany({
       where: {
         participants: {
@@ -150,30 +165,32 @@ export const getConversations = async (req: Request, res: Response) => {
             },
           },
         },
-    messages: {
-  orderBy: {
-    createdAt: "desc",
-  },
-  take: 1,
-  include: {
-    readReceipts: {
-      select: {
-        userId: true,
-        readAt: true,
-      },
-    },
-  },
-},
+        messages: {
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 1,
+          include: {
+            readReceipts: {
+              select: {
+                userId: true,
+                readAt: true,
+              },
+            },
+          },
+        },
       },
       orderBy: {
         updatedAt: "desc",
       },
     });
 
-    // 3. Return conversations
+    const conversationsWithStatus =
+      conversations.map(addOnlineStatus);
+
     return res.status(200).json({
       message: "Conversations retrieved successfully",
-      conversations,
+      conversations: conversationsWithStatus,
     });
   } catch (error) {
     console.error("Get conversations error:", error);
@@ -184,12 +201,11 @@ export const getConversations = async (req: Request, res: Response) => {
   }
 };
 
-
-
-
-export const searchConversations = async (req: Request, res: Response) => {
+export const searchConversations = async (
+  req: Request,
+  res: Response,
+) => {
   try {
-    // 1. Get authenticated user and search query
     const userId = req.user?.userId;
     const q = req.query.q;
 
@@ -199,14 +215,12 @@ export const searchConversations = async (req: Request, res: Response) => {
       });
     }
 
-    // 2. Validate search query
     if (typeof q !== "string" || !q.trim()) {
       return res.status(400).json({
         message: "Please provide a search term",
       });
     }
 
-    // 3. Search conversations by the other participant
     const conversations = await prisma.conversation.findMany({
       where: {
         AND: [
@@ -265,11 +279,13 @@ export const searchConversations = async (req: Request, res: Response) => {
       },
     });
 
-    // 4. Return search results
+    const conversationsWithStatus =
+      conversations.map(addOnlineStatus);
+
     return res.status(200).json({
       message: "Conversations retrieved successfully",
       count: conversations.length,
-      conversations,
+      conversations: conversationsWithStatus,
     });
   } catch (error) {
     console.error("Search conversations error:", error);
