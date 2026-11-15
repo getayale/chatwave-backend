@@ -6,6 +6,10 @@ import {
   createMessageSchema,
   updateMessageSchema,
 } from "../schemas/message.schema.js";
+import path from "node:path";
+import { existsSync } from "node:fs";
+import type { Express } from "express";
+import { unlink } from "node:fs/promises";
 
 export const sendMessage = async (req: Request, res: Response) => {
   try {
@@ -179,6 +183,7 @@ export const getMessages = async (req: Request, res: Response) => {
             userId: true,
           },
         },
+          attachments: true,
       },
     });
 
@@ -282,62 +287,7 @@ export const updateMessage = async (req: Request, res: Response) => {
       message: "Internal server error",
     });
   }
-};
-
-export const deleteMessage = async (req: Request, res: Response) => {
-  try {
-    // 1. Get authenticated user and message ID
-    const userId = req.user?.userId;
-    const messageId = req.params.messageId;
-
-    if (!userId) {
-      return res.status(401).json({
-        message: "Unauthorized",
-      });
-    }
-
-    if (typeof messageId !== "string") {
-      return res.status(400).json({
-        message: "Invalid message ID",
-      });
-    }
-
-    // 2. Find the message
-    const existingMessage = await prisma.message.findUnique({
-      where: { id: messageId },
-    });
-
-    if (!existingMessage) {
-      return res.status(404).json({
-        message: "Message not found",
-      });
-    }
-
-    // 3. Check message ownership
-    if (existingMessage.senderId !== userId) {
-      return res.status(403).json({
-        message: "You can only delete your own messages",
-      });
-    }
-
-    // 4. Delete the message
-    await prisma.message.delete({
-      where: { id: messageId },
-    });
-
-    // 5. Return successful response
-    return res.status(200).json({
-      message: "Message deleted successfully",
-    });
-  } catch (error) {
-    console.error("Delete message error:", error);
-
-    return res.status(500).json({
-      message: "Internal server error",
-    });
-  }
-};
-
+}
 export const searchMessages = async (req: Request, res: Response) => {
   try {
     // 1. Get authenticated user and conversation ID
@@ -603,6 +553,307 @@ export const getMessageReadReceipts = async (
     });
   } catch (error) {
     console.error("Get message read receipts error:", error);
+
+    return res.status(500).json({
+      message: "Internal server error",
+    });
+  }
+};
+
+
+
+
+export const sendAttachment = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const conversationId = req.params.conversationId;
+    const files = req.files as Express.Multer.File[];
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+      });
+    }
+
+    if (typeof conversationId !== "string") {
+      return res.status(400).json({
+        message: "Invalid conversation ID",
+      });
+    }
+
+    if (!files || files.length === 0) {
+      return res.status(400).json({
+        message: "Please select at least one file",
+      });
+    }
+
+    const content =
+      typeof req.body.content === "string" ? req.body.content.trim() : "";
+
+    const participant = await prisma.conversationParticipant.findUnique({
+      where: {
+        userId_conversationId: {
+          userId,
+          conversationId,
+        },
+      },
+    });
+
+    if (!participant) {
+      return res.status(403).json({
+        message: "You are not a participant in this conversation",
+      });
+    }
+
+    const message = await prisma.$transaction(async (tx) => {
+      return tx.message.create({
+        data: {
+          content,
+          senderId: userId,
+          conversationId,
+          attachments: {
+            create: files.map((file) => ({
+              fileName: file.originalname,
+              storedName: file.filename,
+              mimeType: file.mimetype,
+              size: file.size,
+              storageKey: file.filename,
+              fileUrl: `/uploads/chat-files/${file.filename}`,
+            })),
+          },
+        },
+        include: {
+          sender: {
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+              avatarUrl: true,
+            },
+          },
+          attachments: true,
+        },
+      });
+    });
+
+    await prisma.conversation.update({
+      where: { id: conversationId },
+      data: { updatedAt: new Date() },
+    });
+
+    getIO()
+      .to(`conversation:${conversationId}`)
+      .emit("message:new", message);
+
+    return res.status(201).json({
+      message: "Attachment sent successfully",
+      data: message,
+    });
+  } catch (error) {
+    console.error("Send attachment error:", error);
+
+    return res.status(500).json({
+      message: "Internal server error",
+    });
+  }
+};
+
+
+
+
+
+export const downloadAttachment = async (
+  req: Request,
+  res: Response,
+) => {
+  try {
+    const userId = req.user?.userId;
+    const attachmentId = req.params.attachmentId;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+      });
+    }
+
+    if (typeof attachmentId !== "string") {
+      return res.status(400).json({
+        message: "Invalid attachment ID",
+      });
+    }
+
+    const attachment = await prisma.chatAttachment.findUnique({
+      where: { id: attachmentId },
+      include: {
+        message: {
+          select: {
+            conversationId: true,
+          },
+        },
+      },
+    });
+
+    if (!attachment) {
+      return res.status(404).json({
+        message: "Attachment not found",
+      });
+    }
+
+    const participant =
+      await prisma.conversationParticipant.findUnique({
+        where: {
+          userId_conversationId: {
+            userId,
+            conversationId: attachment.message.conversationId,
+          },
+        },
+      });
+
+    if (!participant) {
+      return res.status(403).json({
+        message: "You cannot access this attachment",
+      });
+    }
+
+    const uploadDirectory = path.resolve("uploads/chat-files");
+    const filePath = path.resolve(
+      uploadDirectory,
+      path.basename(attachment.storageKey),
+    );
+
+    if (!existsSync(filePath)) {
+      return res.status(404).json({
+        message: "File not found on server",
+      });
+    }
+
+    return res.download(
+      filePath,
+      attachment.fileName,
+      (error) => {
+        if (error && !res.headersSent) {
+          console.error("File download error:", error);
+          res.status(500).json({
+            message: "Unable to download file",
+          });
+        }
+      },
+    );
+  } catch (error) {
+    console.error("Download attachment error:", error);
+
+    return res.status(500).json({
+      message: "Internal server error",
+    });
+  }
+};
+
+
+
+
+export const deleteMessage = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const messageId = req.params.messageId;
+
+    // 1. Validate authenticated user
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+      });
+    }
+
+    if (typeof messageId !== "string") {
+      return res.status(400).json({
+        message: "Invalid message ID",
+      });
+    }
+
+    // 2. Find the message and its attachments
+    const existingMessage = await prisma.message.findUnique({
+      where: { id: messageId },
+      include: {
+        attachments: true,
+      },
+    });
+
+    if (!existingMessage) {
+      return res.status(404).json({
+        message: "Message not found",
+      });
+    }
+
+    // 3. Only the sender can delete their message
+    if (existingMessage.senderId !== userId) {
+      return res.status(403).json({
+        message: "You can only delete your own messages",
+      });
+    }
+
+    // 4. Delete the message from the database
+    // Prisma also deletes its attachments and read receipts
+    // because of onDelete: Cascade.
+    await prisma.message.delete({
+      where: { id: messageId },
+    });
+
+    // 5. Delete the physical attachment files
+    const uploadDirectory = path.resolve("uploads/chat-files");
+
+    const cleanupResults = await Promise.allSettled(
+      existingMessage.attachments.map(async (attachment) => {
+        const filePath = path.resolve(
+          uploadDirectory,
+          path.basename(attachment.storageKey),
+        );
+
+        // Ensure the file is inside the upload directory
+        if (!filePath.startsWith(`${uploadDirectory}${path.sep}`)) {
+          throw new Error("Invalid attachment file path");
+        }
+
+        try {
+          await unlink(filePath);
+        } catch (error) {
+          // Ignore files that are already missing
+          if (
+            typeof error === "object" &&
+            error !== null &&
+            "code" in error &&
+            error.code === "ENOENT"
+          ) {
+            return;
+          }
+
+          throw error;
+        }
+      }),
+    );
+
+    // Log any physical files that could not be deleted
+    cleanupResults.forEach((result) => {
+      if (result.status === "rejected") {
+        console.error(
+          "Attachment cleanup error:",
+          result.reason,
+        );
+      }
+    });
+
+    // 6. Notify everyone in this conversation
+    getIO()
+      .to(`conversation:${existingMessage.conversationId}`)
+      .emit("message:deleted", {
+        messageId,
+        conversationId: existingMessage.conversationId,
+      });
+
+    return res.status(200).json({
+      message: "Message deleted successfully",
+      messageId,
+    });
+  } catch (error) {
+    console.error("Delete message error:", error);
 
     return res.status(500).json({
       message: "Internal server error",

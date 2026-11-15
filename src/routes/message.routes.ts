@@ -1,8 +1,8 @@
 
 import { Router } from "express";
-import { deleteMessage, getMessages, markMessagesAsRead, searchMessages, sendMessage, updateMessage } from "../controllers/message.controller.js";
+import { deleteMessage, downloadAttachment, getMessages, markMessagesAsRead, searchMessages, sendAttachment, sendMessage, updateMessage } from "../controllers/message.controller.js";
 import { authenticateToken } from "../middleware/auth.middleware.js";
-
+import { chatUpload } from "../config/chat-upload.js";
 const messageRouter = Router();
 
 messageRouter.post(
@@ -38,4 +38,16 @@ messageRouter.get(
   "/conversations/:conversationId/read",
   authenticateToken,
   markMessagesAsRead);
+
+  messageRouter.post(
+  "/conversations/:conversationId/attachments",
+  authenticateToken,
+  chatUpload.array("files", 5),
+  sendAttachment
+);
+
+messageRouter.get(
+  "/attachments/:attachmentId/download",
+  authenticateToken,
+  downloadAttachment);
 export default messageRouter;

@@ -73,9 +73,13 @@ io.on("connection", (socket) => {
   const userId = socket.data.userId;
 
   console.log(`User connected: ${userId}`);
+  console.log(`Socket ID: ${socket.id}`);
 
   // Track this user's socket connection
   const wasOffline = addUserConnection(userId, socket.id);
+
+  console.log("Was previously offline:", wasOffline);
+  console.log("Current online users:", getOnlineUsers());
 
   // Broadcast online status only when the user first connects
   if (wasOffline) {
@@ -193,25 +197,36 @@ io.on("connection", (socket) => {
       });
   });
 
-  // Handle disconnection
+  // 5. Handle disconnection
   socket.on("disconnect", () => {
     console.log(`User disconnected: ${userId}`);
+    console.log(`Disconnected socket ID: ${socket.id}`);
 
     const becameOffline = removeUserConnection(
       userId,
       socket.id,
     );
 
+    // Diagnostic logs
+    console.log("Became offline:", becameOffline);
+    console.log("Remaining online users:", getOnlineUsers());
+
     // Broadcast offline status only when all connections are closed
     if (becameOffline) {
+      console.log(`Broadcasting offline status for: ${userId}`);
+
       socket.broadcast.emit("presence:offline", {
         userId,
       });
+    } else {
+      console.log(
+        `User ${userId} still has another active connection`,
+      );
     }
   });
 });
 
-// 5. Start server
+// 6. Start server
 httpServer.listen(PORT, () => {
   console.log(`ChatWave API running on port ${PORT}`);
   console.log("Socket.IO is ready");
