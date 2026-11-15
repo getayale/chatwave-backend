@@ -11,6 +11,7 @@ import { existsSync } from "node:fs";
 import type { Express } from "express";
 import { unlink } from "node:fs/promises";
 
+
 export const sendMessage = async (req: Request, res: Response) => {
   try {
     // 1. Validate incoming data
@@ -41,10 +42,22 @@ export const sendMessage = async (req: Request, res: Response) => {
       });
     }
 
-    // 3. Check whether the conversation exists
+    // 3. Check conversation existence and user participation
     const conversation = await prisma.conversation.findUnique({
-      where: { id: conversationId },
-      select: { id: true },
+      where: {
+        id: conversationId,
+      },
+      select: {
+        id: true,
+        participants: {
+          where: {
+            userId,
+          },
+          select: {
+            id: true,
+          },
+        },
+      },
     });
 
     if (!conversation) {
@@ -53,23 +66,13 @@ export const sendMessage = async (req: Request, res: Response) => {
       });
     }
 
-    // 4. Check whether the user belongs to this conversation
-    const participant = await prisma.conversationParticipant.findUnique({
-      where: {
-        userId_conversationId: {
-          userId,
-          conversationId,
-        },
-      },
-    });
-
-    if (!participant) {
+    if (conversation.participants.length === 0) {
       return res.status(403).json({
         message: "You are not a participant in this conversation",
       });
     }
 
-    // 5. Save the message
+    // 4. Save the message
     const message = await prisma.message.create({
       data: {
         content,
@@ -88,20 +91,22 @@ export const sendMessage = async (req: Request, res: Response) => {
       },
     });
 
-    // 6. Update conversation activity
+    // 5. Update conversation activity
     await prisma.conversation.update({
-      where: { id: conversationId },
+      where: {
+        id: conversationId,
+      },
       data: {
         updatedAt: new Date(),
       },
     });
 
-    // 7. Broadcast the saved message through Socket.IO
+    // 6. Broadcast the saved message through Socket.IO
     getIO()
       .to(`conversation:${conversationId}`)
       .emit("message:new", message);
 
-    // 8. Return successful response
+    // 7. Return successful response
     return res.status(201).json({
       message: "Message sent successfully",
       data: message,
@@ -133,10 +138,22 @@ export const getMessages = async (req: Request, res: Response) => {
       });
     }
 
-    // 2. Check whether the conversation exists
+    // 2. Check conversation existence and user participation
     const conversation = await prisma.conversation.findUnique({
-      where: { id: conversationId },
-      select: { id: true },
+      where: {
+        id: conversationId,
+      },
+      select: {
+        id: true,
+        participants: {
+          where: {
+            userId,
+          },
+          select: {
+            id: true,
+          },
+        },
+      },
     });
 
     if (!conversation) {
@@ -145,30 +162,31 @@ export const getMessages = async (req: Request, res: Response) => {
       });
     }
 
-    // 3. Check whether the user belongs to this conversation
-    const participant = await prisma.conversationParticipant.findUnique({
-      where: {
-        userId_conversationId: {
-          userId,
-          conversationId,
-        },
-      },
-    });
-
-    if (!participant) {
+    if (conversation.participants.length === 0) {
       return res.status(403).json({
         message: "You are not a participant in this conversation",
       });
     }
 
-    // 4. Retrieve messages and their read receipts
+    // 3. Get pagination parameters
+    const limit = Math.min(
+      Math.max(Number(req.query.limit) || 30, 1),
+      100,
+    );
+
+    const page = Math.max(Number(req.query.page) || 1, 1);
+    const skip = (page - 1) * limit;
+
+    // 4. Retrieve paginated messages
     const messages = await prisma.message.findMany({
       where: {
         conversationId,
       },
       orderBy: {
-        createdAt: "asc",
+        createdAt: "desc",
       },
+      skip,
+      take: limit,
       include: {
         sender: {
           select: {
@@ -183,11 +201,11 @@ export const getMessages = async (req: Request, res: Response) => {
             userId: true,
           },
         },
-          attachments: true,
+        attachments: true,
       },
     });
 
-    // 5. Calculate whether each message has been read
+    // 5. Calculate read status
     const messagesWithReadStatus = messages.map((message) => {
       const isRead = message.readReceipts.some(
         (receipt) => receipt.userId !== message.senderId,
@@ -202,7 +220,12 @@ export const getMessages = async (req: Request, res: Response) => {
     // 6. Return messages
     return res.status(200).json({
       message: "Messages retrieved successfully",
-      messages: messagesWithReadStatus,
+      messages: messagesWithReadStatus.reverse(),
+      pagination: {
+        page,
+        limit,
+        hasMore: messages.length === limit,
+      },
     });
   } catch (error) {
     console.error("Get messages error:", error);
@@ -212,6 +235,8 @@ export const getMessages = async (req: Request, res: Response) => {
     });
   }
 };
+
+
 
 export const updateMessage = async (req: Request, res: Response) => {
   try {
@@ -242,28 +267,43 @@ export const updateMessage = async (req: Request, res: Response) => {
       });
     }
 
-    // 3. Find the message
-    const existingMessage = await prisma.message.findUnique({
-      where: { id: messageId },
+    // 3. Update only if the message belongs to the authenticated user
+    const resultUpdate = await prisma.message.updateMany({
+      where: {
+        id: messageId,
+        senderId: userId,
+      },
+      data: {
+        content,
+      },
     });
 
-    if (!existingMessage) {
-      return res.status(404).json({
-        message: "Message not found",
+    if (resultUpdate.count === 0) {
+      const messageExists = await prisma.message.findUnique({
+        where: {
+          id: messageId,
+        },
+        select: {
+          id: true,
+        },
       });
-    }
 
-    // 4. Check message ownership
-    if (existingMessage.senderId !== userId) {
+      if (!messageExists) {
+        return res.status(404).json({
+          message: "Message not found",
+        });
+      }
+
       return res.status(403).json({
         message: "You can only edit your own messages",
       });
     }
 
-    // 5. Update the message
-    const updatedMessage = await prisma.message.update({
-      where: { id: messageId },
-      data: { content },
+    // 4. Retrieve the updated message
+    const updatedMessage = await prisma.message.findUnique({
+      where: {
+        id: messageId,
+      },
       include: {
         sender: {
           select: {
@@ -287,7 +327,8 @@ export const updateMessage = async (req: Request, res: Response) => {
       message: "Internal server error",
     });
   }
-}
+};
+
 export const searchMessages = async (req: Request, res: Response) => {
   try {
     // 1. Get authenticated user and conversation ID
@@ -314,9 +355,24 @@ export const searchMessages = async (req: Request, res: Response) => {
       });
     }
 
-    // 3. Check whether the conversation exists
+    const searchTerm = q.trim();
+
+    // 3. Check conversation existence and user participation
     const conversation = await prisma.conversation.findUnique({
-      where: { id: conversationId },
+      where: {
+        id: conversationId,
+      },
+      select: {
+        id: true,
+        participants: {
+          where: {
+            userId,
+          },
+          select: {
+            id: true,
+          },
+        },
+      },
     });
 
     if (!conversation) {
@@ -325,32 +381,28 @@ export const searchMessages = async (req: Request, res: Response) => {
       });
     }
 
-    // 4. Check whether the user belongs to this conversation
-    const participant = await prisma.conversationParticipant.findUnique({
-      where: {
-        userId_conversationId: {
-          userId,
-          conversationId,
-        },
-      },
-    });
-
-    if (!participant) {
+    if (conversation.participants.length === 0) {
       return res.status(403).json({
         message: "You are not a participant in this conversation",
       });
     }
 
-    // 5. Search messages
+    // 4. Search messages
     const messages = await prisma.message.findMany({
       where: {
         conversationId,
         content: {
-          contains: q.trim(),
+          contains: searchTerm,
           mode: "insensitive",
         },
       },
-      include: {
+      select: {
+        id: true,
+        content: true,
+        senderId: true,
+        conversationId: true,
+        createdAt: true,
+        updatedAt: true,
         sender: {
           select: {
             id: true,
@@ -366,7 +418,7 @@ export const searchMessages = async (req: Request, res: Response) => {
       take: 50,
     });
 
-    // 6. Return search results
+    // 5. Return search results
     return res.status(200).json({
       message: "Messages retrieved successfully",
       count: messages.length,
@@ -380,6 +432,7 @@ export const searchMessages = async (req: Request, res: Response) => {
     });
   }
 };
+
 
 export const markMessagesAsRead = async (req: Request, res: Response) => {
   try {
@@ -399,9 +452,22 @@ export const markMessagesAsRead = async (req: Request, res: Response) => {
       });
     }
 
-    // 2. Check whether the conversation exists
+    // 2. Check conversation existence and user participation
     const conversation = await prisma.conversation.findUnique({
-      where: { id: conversationId },
+      where: {
+        id: conversationId,
+      },
+      select: {
+        id: true,
+        participants: {
+          where: {
+            userId,
+          },
+          select: {
+            id: true,
+          },
+        },
+      },
     });
 
     if (!conversation) {
@@ -410,65 +476,47 @@ export const markMessagesAsRead = async (req: Request, res: Response) => {
       });
     }
 
-    // 3. Verify conversation membership
-    const participant = await prisma.conversationParticipant.findUnique({
-      where: {
-        userId_conversationId: {
-          userId,
-          conversationId,
-        },
-      },
-    });
-
-    if (!participant) {
+    if (conversation.participants.length === 0) {
       return res.status(403).json({
         message: "You are not a participant in this conversation",
       });
     }
 
-    // 4. Retrieve unread messages sent by other users
-    const messages = await prisma.message.findMany({
-      where: {
-        conversationId,
-        senderId: {
-          not: userId,
-        },
-        readReceipts: {
-          none: {
-            userId,
-          },
-        },
-      },
-      select: {
-        id: true,
-      },
-    });
+    // 3. Create read receipts directly in the database
+    const markedAt = new Date();
 
-    // 5. Create read receipts without duplicates
-    const result = await prisma.messageRead.createMany({
-      data: messages.map((message) => ({
-        messageId: message.id,
-        userId,
-      })),
-      skipDuplicates: true,
-    });
+    const markedCount = await prisma.$executeRaw`
+      INSERT INTO "MessageRead" ("id", "messageId", "userId", "readAt")
+      SELECT
+        gen_random_uuid()::text,
+        m."id",
+        ${userId},
+        ${markedAt}
+      FROM "Message" m
+      WHERE m."conversationId" = ${conversationId}
+        AND m."senderId" != ${userId}
+        AND NOT EXISTS (
+          SELECT 1
+          FROM "MessageRead" mr
+          WHERE mr."messageId" = m."id"
+            AND mr."userId" = ${userId}
+        )
+      ON CONFLICT ("messageId", "userId") DO NOTHING
+    `;
 
-    // 6. Notify other conversation participants
-    if (result.count > 0) {
-      const io = getIO();
-
-      io.to(`conversation:${conversationId}`).emit("message:read", {
+    // 4. Notify other conversation participants
+    if (markedCount > 0) {
+      getIO().to(`conversation:${conversationId}`).emit("message:read", {
         conversationId,
         userId,
-        messageIds: messages.map((message) => message.id),
-        readAt: new Date().toISOString(),
+        readAt: markedAt.toISOString(),
       });
     }
 
-    // 7. Return the result
+    // 5. Return the result
     return res.status(200).json({
       message: "Messages marked as read successfully",
-      markedAsRead: result.count,
+      markedAsRead: markedCount,
     });
   } catch (error) {
     console.error("Mark messages as read error:", error);
@@ -501,12 +549,24 @@ export const getMessageReadReceipts = async (
       });
     }
 
-    // 2. Find the message
-    const message = await prisma.message.findUnique({
-      where: { id: messageId },
-      include: {
+    // 2. Find message and verify conversation membership
+    const message = await prisma.message.findFirst({
+      where: {
+        id: messageId,
+        conversation: {
+          participants: {
+            some: {
+              userId,
+            },
+          },
+        },
+      },
+      select: {
+        id: true,
         readReceipts: {
-          include: {
+          select: {
+            id: true,
+            readAt: true,
             user: {
               select: {
                 id: true,
@@ -520,23 +580,23 @@ export const getMessageReadReceipts = async (
       },
     });
 
+    // 3. Handle missing message
     if (!message) {
-      return res.status(404).json({
-        message: "Message not found",
-      });
-    }
-
-    // 3. Verify conversation membership
-    const participant = await prisma.conversationParticipant.findUnique({
-      where: {
-        userId_conversationId: {
-          userId,
-          conversationId: message.conversationId,
+      const messageExists = await prisma.message.findUnique({
+        where: {
+          id: messageId,
         },
-      },
-    });
+        select: {
+          id: true,
+        },
+      });
 
-    if (!participant) {
+      if (!messageExists) {
+        return res.status(404).json({
+          message: "Message not found",
+        });
+      }
+
       return res.status(403).json({
         message: "You are not a participant in this conversation",
       });
@@ -545,11 +605,7 @@ export const getMessageReadReceipts = async (
     // 4. Return read receipts
     return res.status(200).json({
       message: "Read receipts retrieved successfully",
-      readReceipts: message.readReceipts.map((receipt) => ({
-        id: receipt.id,
-        readAt: receipt.readAt,
-        user: receipt.user,
-      })),
+      readReceipts: message.readReceipts,
     });
   } catch (error) {
     console.error("Get message read receipts error:", error);
@@ -565,6 +621,7 @@ export const getMessageReadReceipts = async (
 
 export const sendAttachment = async (req: Request, res: Response) => {
   try {
+    // 1. Get authenticated user and request data
     const userId = req.user?.userId;
     const conversationId = req.params.conversationId;
     const files = req.files as Express.Multer.File[];
@@ -590,23 +647,39 @@ export const sendAttachment = async (req: Request, res: Response) => {
     const content =
       typeof req.body.content === "string" ? req.body.content.trim() : "";
 
-    const participant = await prisma.conversationParticipant.findUnique({
+    // 2. Check conversation existence and membership
+    const conversation = await prisma.conversation.findUnique({
       where: {
-        userId_conversationId: {
-          userId,
-          conversationId,
+        id: conversationId,
+      },
+      select: {
+        id: true,
+        participants: {
+          where: {
+            userId,
+          },
+          select: {
+            id: true,
+          },
         },
       },
     });
 
-    if (!participant) {
+    if (!conversation) {
+      return res.status(404).json({
+        message: "Conversation not found",
+      });
+    }
+
+    if (conversation.participants.length === 0) {
       return res.status(403).json({
         message: "You are not a participant in this conversation",
       });
     }
 
+    // 3. Create message, attachments, and update conversation
     const message = await prisma.$transaction(async (tx) => {
-      return tx.message.create({
+      const newMessage = await tx.message.create({
         data: {
           content,
           senderId: userId,
@@ -634,17 +707,25 @@ export const sendAttachment = async (req: Request, res: Response) => {
           attachments: true,
         },
       });
+
+      await tx.conversation.update({
+        where: {
+          id: conversationId,
+        },
+        data: {
+          updatedAt: new Date(),
+        },
+      });
+
+      return newMessage;
     });
 
-    await prisma.conversation.update({
-      where: { id: conversationId },
-      data: { updatedAt: new Date() },
-    });
-
+    // 4. Broadcast the saved message
     getIO()
       .to(`conversation:${conversationId}`)
       .emit("message:new", message);
 
+    // 5. Return successful response
     return res.status(201).json({
       message: "Attachment sent successfully",
       data: message,
@@ -667,6 +748,7 @@ export const downloadAttachment = async (
   res: Response,
 ) => {
   try {
+    // 1. Get authenticated user and attachment ID
     const userId = req.user?.userId;
     const attachmentId = req.params.attachmentId;
 
@@ -682,60 +764,64 @@ export const downloadAttachment = async (
       });
     }
 
-    const attachment = await prisma.chatAttachment.findUnique({
-      where: { id: attachmentId },
-      include: {
+    // 2. Find attachment and verify conversation membership
+    const attachment = await prisma.chatAttachment.findFirst({
+      where: {
+        id: attachmentId,
         message: {
-          select: {
-            conversationId: true,
+          conversation: {
+            participants: {
+              some: {
+                userId,
+              },
+            },
           },
         },
+      },
+      select: {
+        fileName: true,
+        storageKey: true,
       },
     });
 
     if (!attachment) {
       return res.status(404).json({
-        message: "Attachment not found",
+        message: "Attachment not found or you cannot access it",
       });
     }
 
-    const participant =
-      await prisma.conversationParticipant.findUnique({
-        where: {
-          userId_conversationId: {
-            userId,
-            conversationId: attachment.message.conversationId,
-          },
-        },
-      });
-
-    if (!participant) {
-      return res.status(403).json({
-        message: "You cannot access this attachment",
-      });
-    }
-
+    // 3. Safely resolve file path
     const uploadDirectory = path.resolve("uploads/chat-files");
+
     const filePath = path.resolve(
       uploadDirectory,
       path.basename(attachment.storageKey),
     );
 
-    if (!existsSync(filePath)) {
-      return res.status(404).json({
-        message: "File not found on server",
-      });
-    }
-
+    // 4. Download file using streaming
     return res.download(
       filePath,
       attachment.fileName,
       (error) => {
-        if (error && !res.headersSent) {
-          console.error("File download error:", error);
-          res.status(500).json({
-            message: "Unable to download file",
-          });
+        if (error) {
+          if (!res.headersSent) {
+            if (
+              "code" in error &&
+              error.code === "ENOENT"
+            ) {
+              return res.status(404).json({
+                message: "File not found on server",
+              });
+            }
+
+            console.error("File download error:", error);
+
+            return res.status(500).json({
+              message: "Unable to download file",
+            });
+          }
+
+          console.error("File download interrupted:", error);
         }
       },
     );
@@ -750,13 +836,12 @@ export const downloadAttachment = async (
 
 
 
-
 export const deleteMessage = async (req: Request, res: Response) => {
   try {
+    // 1. Get authenticated user and message ID
     const userId = req.user?.userId;
     const messageId = req.params.messageId;
 
-    // 1. Validate authenticated user
     if (!userId) {
       return res.status(401).json({
         message: "Unauthorized",
@@ -769,35 +854,54 @@ export const deleteMessage = async (req: Request, res: Response) => {
       });
     }
 
-    // 2. Find the message and its attachments
-    const existingMessage = await prisma.message.findUnique({
-      where: { id: messageId },
-      include: {
-        attachments: true,
+    // 2. Find the message and verify ownership
+    const existingMessage = await prisma.message.findFirst({
+      where: {
+        id: messageId,
+        senderId: userId,
+      },
+      select: {
+        id: true,
+        conversationId: true,
+        attachments: {
+          select: {
+            storageKey: true,
+          },
+        },
       },
     });
 
     if (!existingMessage) {
-      return res.status(404).json({
-        message: "Message not found",
+      // Check whether the message exists
+      const messageExists = await prisma.message.findUnique({
+        where: {
+          id: messageId,
+        },
+        select: {
+          id: true,
+        },
       });
-    }
 
-    // 3. Only the sender can delete their message
-    if (existingMessage.senderId !== userId) {
+      if (!messageExists) {
+        return res.status(404).json({
+          message: "Message not found",
+        });
+      }
+
       return res.status(403).json({
         message: "You can only delete your own messages",
       });
     }
 
-    // 4. Delete the message from the database
-    // Prisma also deletes its attachments and read receipts
-    // because of onDelete: Cascade.
+    // 3. Delete the message from the database
+    // Attachments and read receipts are deleted through cascade.
     await prisma.message.delete({
-      where: { id: messageId },
+      where: {
+        id: messageId,
+      },
     });
 
-    // 5. Delete the physical attachment files
+    // 4. Delete physical attachment files
     const uploadDirectory = path.resolve("uploads/chat-files");
 
     const cleanupResults = await Promise.allSettled(
@@ -815,7 +919,6 @@ export const deleteMessage = async (req: Request, res: Response) => {
         try {
           await unlink(filePath);
         } catch (error) {
-          // Ignore files that are already missing
           if (
             typeof error === "object" &&
             error !== null &&
@@ -830,7 +933,7 @@ export const deleteMessage = async (req: Request, res: Response) => {
       }),
     );
 
-    // Log any physical files that could not be deleted
+    // 5. Log failed file cleanup operations
     cleanupResults.forEach((result) => {
       if (result.status === "rejected") {
         console.error(
@@ -840,7 +943,7 @@ export const deleteMessage = async (req: Request, res: Response) => {
       }
     });
 
-    // 6. Notify everyone in this conversation
+    // 6. Notify conversation participants
     getIO()
       .to(`conversation:${existingMessage.conversationId}`)
       .emit("message:deleted", {
@@ -848,6 +951,7 @@ export const deleteMessage = async (req: Request, res: Response) => {
         conversationId: existingMessage.conversationId,
       });
 
+    // 7. Return successful response
     return res.status(200).json({
       message: "Message deleted successfully",
       messageId,

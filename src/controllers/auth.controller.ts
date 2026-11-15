@@ -1,12 +1,18 @@
+
 import type { Request, Response } from "express";
 import bcrypt from "bcrypt";
-import prisma from "../config/prisma.js";
-import { registerSchema, loginSchema } from "../schemas/auth.schema.js";
+import jwt from "jsonwebtoken";
 import { Prisma } from "../generated/prisma/client.js";
 
-import jwt from "jsonwebtoken";
+import prisma from "../config/prisma.js";
+import {
+  registerSchema,
+  loginSchema,
+} from "../schemas/auth.schema.js";
 
-
+// ==========================================
+// REGISTER USER
+// ==========================================
 
 export const registerUser = async (req: Request, res: Response) => {
   try {
@@ -23,10 +29,11 @@ export const registerUser = async (req: Request, res: Response) => {
     // 2. Extract validated data
     const { username, email, password, displayName } = result.data;
 
-    // 3. Hash the password
+    // 3. Hash password
+    // Keep 12 salt rounds for password security.
     const passwordHash = await bcrypt.hash(password, 12);
 
-    // 4. Create the user in PostgreSQL
+    // 4. Create user
     const user = await prisma.user.create({
       data: {
         username,
@@ -43,29 +50,33 @@ export const registerUser = async (req: Request, res: Response) => {
       },
     });
 
-    // 5. Return successful response
+    // 5. Return response
     return res.status(201).json({
       message: "Account created successfully",
       user,
     });
   } catch (error) {
-  if (
-    error instanceof Prisma.PrismaClientKnownRequestError &&
-    error.code === "P2002"
-  ) {
-    return res.status(409).json({
-      message: "Username or email already exists",
+    // Handle duplicate username or email
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2002"
+    ) {
+      return res.status(409).json({
+        message: "Username or email already exists",
+      });
+    }
+
+    console.error("Registration error:", error);
+
+    return res.status(500).json({
+      message: "Internal server error",
     });
   }
-
-  console.error("Registration error:", error);
-
-  return res.status(500).json({
-    message: "Internal server error",
-  });
-}
 };
 
+// ==========================================
+// LOGIN USER
+// ==========================================
 
 export const loginUser = async (req: Request, res: Response) => {
   try {
@@ -82,9 +93,17 @@ export const loginUser = async (req: Request, res: Response) => {
     // 2. Extract validated data
     const { email, password } = result.data;
 
-    // 3. Find user by email
+    // 3. Find user and retrieve only required fields
     const user = await prisma.user.findUnique({
       where: { email },
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        displayName: true,
+        avatarUrl: true,
+        passwordHash: true,
+      },
     });
 
     if (!user) {
@@ -93,10 +112,10 @@ export const loginUser = async (req: Request, res: Response) => {
       });
     }
 
-    // 4. Compare submitted password with stored hash
+    // 4. Verify password
     const passwordMatches = await bcrypt.compare(
       password,
-      user.passwordHash
+      user.passwordHash,
     );
 
     if (!passwordMatches) {
@@ -105,7 +124,7 @@ export const loginUser = async (req: Request, res: Response) => {
       });
     }
 
-    // 5. Check JWT secret
+    // 5. Get JWT secret
     const jwtSecret = process.env.JWT_SECRET;
 
     if (!jwtSecret) {
@@ -116,10 +135,10 @@ export const loginUser = async (req: Request, res: Response) => {
     const token = jwt.sign(
       { userId: user.id },
       jwtSecret,
-      { expiresIn: "1d" }
+      { expiresIn: "1d" },
     );
 
-    // 7. Return successful response
+    // 7. Return response without password hash
     return res.status(200).json({
       message: "Login successful",
       token,
@@ -140,10 +159,13 @@ export const loginUser = async (req: Request, res: Response) => {
   }
 };
 
-
+// ==========================================
+// GET CURRENT USER
+// ==========================================
 
 export const getCurrentUser = async (req: Request, res: Response) => {
   try {
+    // 1. Get authenticated user ID
     const userId = req.user?.userId;
 
     if (!userId) {
@@ -152,6 +174,7 @@ export const getCurrentUser = async (req: Request, res: Response) => {
       });
     }
 
+    // 2. Retrieve only required profile fields
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: {
@@ -171,6 +194,7 @@ export const getCurrentUser = async (req: Request, res: Response) => {
       });
     }
 
+    // 3. Return profile
     return res.status(200).json({
       message: "User profile retrieved successfully",
       user,

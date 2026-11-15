@@ -4,11 +4,21 @@ import { updateProfileSchema } from "../schemas/user.schema.js";
 import { unlink } from "node:fs/promises";
 import path from "node:path";
 
-
+import { Prisma } from "../generated/prisma/client.js";
+import { getCache, setCache } from "../config/cache.js";
 
 export const updateProfile = async (req: Request, res: Response) => {
   try {
-    // 1. Validate incoming data
+    // 1. Validate authenticated user
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+      });
+    }
+
+    // 2. Validate incoming data
     const result = updateProfileSchema.safeParse(req.body);
 
     if (!result.success) {
@@ -18,18 +28,11 @@ export const updateProfile = async (req: Request, res: Response) => {
       });
     }
 
-    // 2. Get authenticated user ID
-    const userId = req.user?.userId;
-
-    if (!userId) {
-      return res.status(401).json({
-        message: "Unauthorized",
-      });
-    }
-
-    // 3. Update profile in PostgreSQL
+    // 3. Update profile and retrieve selected fields
     const user = await prisma.user.update({
-      where: { id: userId },
+      where: {
+        id: userId,
+      },
       data: result.data,
       select: {
         id: true,
@@ -50,6 +53,15 @@ export const updateProfile = async (req: Request, res: Response) => {
   } catch (error) {
     console.error("Profile update error:", error);
 
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2025"
+    ) {
+      return res.status(404).json({
+        message: "User not found",
+      });
+    }
+
     return res.status(500).json({
       message: "Internal server error",
     });
@@ -57,9 +69,123 @@ export const updateProfile = async (req: Request, res: Response) => {
 };
 
 
+
+export const getProfilePhotos = async (
+  req: Request,
+  res: Response,
+) => {
+  try {
+    // 1. Validate authenticated user
+    const currentUserId = req.user?.userId;
+
+    if (!currentUserId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+      });
+    }
+
+    // 2. Determine whose photos to retrieve
+    const targetUserId =
+      typeof req.query.userId === "string"
+        ? req.query.userId
+        : currentUserId;
+
+    // 3. Check current profile visibility
+    const targetUser = await prisma.user.findUnique({
+      where: {
+        id: targetUserId,
+      },
+      select: {
+        id: true,
+        profileVisibility: true,
+      },
+    });
+
+    if (!targetUser) {
+      return res.status(404).json({
+        message: "User not found",
+      });
+    }
+
+    // 4. Enforce profile privacy before accessing cache
+    if (
+      targetUser.profileVisibility === "PRIVATE" &&
+      targetUser.id !== currentUserId
+    ) {
+      return res.status(403).json({
+        message: "This user's profile is private",
+      });
+    }
+
+    // 5. Create a unique cache key for this user's photos
+    const cacheKey = `user:profile-photos:${targetUserId}`;
+
+    // 6. Try retrieving photos from Redis
+    try {
+      const cachedPhotos = await getCache<unknown[]>(cacheKey);
+
+      if (cachedPhotos !== null) {
+        return res.status(200).json({
+          message: "Profile photos retrieved successfully",
+          photos: cachedPhotos,
+        });
+      }
+    } catch (cacheError) {
+      console.error("Redis cache retrieval error:", cacheError);
+    }
+
+    // 7. If cache misses, retrieve photos from PostgreSQL
+    const photos = await prisma.profilePhoto.findMany({
+      where: {
+        userId: targetUserId,
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+      select: {
+        id: true,
+        imageUrl: true,
+        storageKey: true,
+        userId: true,
+        createdAt: true,
+      },
+    });
+
+    // 8. Store photos in Redis for 60 seconds
+    try {
+      await setCache(cacheKey, photos, 60);
+    } catch (cacheError) {
+      console.error("Redis cache storage error:", cacheError);
+    }
+
+    // 9. Return photos
+    return res.status(200).json({
+      message: "Profile photos retrieved successfully",
+      photos,
+    });
+  } catch (error) {
+    console.error("Get profile photos error:", error);
+
+    return res.status(500).json({
+      message: "Internal server error",
+    });
+  }
+};
+
+
+
 export const searchUsers = async (req: Request, res: Response) => {
   try {
-    // 1. Get the search query
+    // 1. Validate authenticated user
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+      });
+    }
+
+    // 2. Extract and validate search query
     const query =
       typeof req.query.q === "string" ? req.query.q.trim() : "";
 
@@ -69,19 +195,12 @@ export const searchUsers = async (req: Request, res: Response) => {
       });
     }
 
-    // 2. Get authenticated user ID
-    const userId = req.user?.userId;
-
-    if (!userId) {
-      return res.status(401).json({
-        message: "Unauthorized",
-      });
-    }
-
-    // 3. Search for other users
+    // 3. Search users
     const users = await prisma.user.findMany({
       where: {
-        id: { not: userId },
+        id: {
+          not: userId,
+        },
         OR: [
           {
             username: {
@@ -104,6 +223,9 @@ export const searchUsers = async (req: Request, res: Response) => {
         avatarUrl: true,
       },
       take: 10,
+      orderBy: {
+        username: "asc",
+      },
     });
 
     // 4. Return search results
@@ -124,35 +246,41 @@ export const uploadProfilePhotos = async (
   req: Request,
   res: Response,
 ) => {
-  let files: Express.Multer.File[] = [];
+  const files = (req.files as Express.Multer.File[] | undefined) ?? [];
 
   try {
-    // 1. Get authenticated user ID
+    // 1. Validate authenticated user
     const userId = req.user?.userId;
 
     if (!userId) {
+      // Remove files already uploaded by Multer
+      await Promise.allSettled(
+        files.map((file) => unlink(file.path)),
+      );
+
       return res.status(401).json({
         message: "Unauthorized",
       });
     }
 
-    // 2. Get uploaded files
-    files = (req.files as Express.Multer.File[] | undefined) ?? [];
-
+    // 2. Validate uploaded files
     if (files.length === 0) {
       return res.status(400).json({
         message: "Please upload at least one photo",
       });
     }
 
-    // 3. Save and retrieve photos in one transaction
+    // 3. Prepare database records once
+    const photoData = files.map((file) => ({
+      imageUrl: `/api/users/profile-photos/${file.filename}`,
+      storageKey: file.filename,
+      userId,
+    }));
+
+    // 4. Create and retrieve uploaded photos
     const uploadedPhotos = await prisma.$transaction(async (tx) => {
       await tx.profilePhoto.createMany({
-        data: files.map((file) => ({
-          imageUrl: `/api/users/profile-photos/${file.filename}`,
-          storageKey: file.filename,
-          userId,
-        })),
+        data: photoData,
       });
 
       return tx.profilePhoto.findMany({
@@ -162,22 +290,38 @@ export const uploadProfilePhotos = async (
             in: files.map((file) => file.filename),
           },
         },
+        select: {
+          id: true,
+          imageUrl: true,
+          storageKey: true,
+          userId: true,
+          createdAt: true,
+        },
         orderBy: {
           createdAt: "desc",
         },
       });
     });
 
-    // 4. Return uploaded photos
+    // 5. Return uploaded photos
     return res.status(201).json({
       message: "Profile photos uploaded successfully",
       photos: uploadedPhotos,
     });
   } catch (error) {
-    // 5. Remove uploaded files if database operations fail
-    await Promise.allSettled(
+    // 6. Remove uploaded files if database operations fail
+    const cleanupResults = await Promise.allSettled(
       files.map((file) => unlink(file.path)),
     );
+
+    cleanupResults.forEach((result) => {
+      if (result.status === "rejected") {
+        console.error(
+          "Profile photo cleanup error:",
+          result.reason,
+        );
+      }
+    });
 
     console.error("Profile photo upload error:", error);
 
@@ -187,89 +331,14 @@ export const uploadProfilePhotos = async (
   }
 };
 
-export const getProfilePhotos = async (req: Request, res: Response) => {
-  try {
-    const currentUserId = req.user?.userId;
 
-    if (!currentUserId) {
-      return res.status(401).json({
-        message: "Unauthorized",
-      });
-    }
-
-    // Get the requested user's ID.
-    // If no userId is provided, retrieve the current user's photos.
-    const targetUserId =
-      typeof req.query.userId === "string"
-        ? req.query.userId
-        : currentUserId;
-
-    // Find the target user and check profile visibility.
-    const targetUser = await prisma.user.findUnique({
-      where: {
-        id: targetUserId,
-      },
-      select: {
-        id: true,
-        profileVisibility: true,
-      },
-    });
-
-    if (!targetUser) {
-      return res.status(404).json({
-        message: "User not found",
-      });
-    }
-
-    // Prevent viewing private profiles belonging to other users.
-    if (
-      targetUser.profileVisibility === "PRIVATE" &&
-      targetUser.id !== currentUserId
-    ) {
-      return res.status(403).json({
-        message: "This user's profile is private",
-      });
-    }
-
-    // Retrieve the permitted user's photos.
-    const photos = await prisma.profilePhoto.findMany({
-      where: {
-        userId: targetUserId,
-      },
-      orderBy: {
-        createdAt: "desc",
-      },
-    });
-
-    return res.status(200).json({
-      message: "Profile photos retrieved successfully",
-      photos,
-    });
-  } catch (error) {
-    console.error("Get Profile photos error:", error);
-
-    return res.status(500).json({
-      message: "Internal Server Error",
-    });
-  }
-};
-
-
+// DELETE PROFILE PHOTO
 export const deleteProfilePhoto = async (
   req: Request,
   res: Response,
 ) => {
   try {
-    // 1. Get photo ID
-    const photoId = req.params.photoId;
-
-    if (typeof photoId !== "string") {
-      return res.status(400).json({
-        message: "Invalid photo ID",
-      });
-    }
-
-    // 2. Get authenticated user ID
+    // 1. Validate authenticated user
     const userId = req.user?.userId;
 
     if (!userId) {
@@ -278,10 +347,24 @@ export const deleteProfilePhoto = async (
       });
     }
 
+    // 2. Validate photo ID
+    const photoId = req.params.photoId;
+
+    if (typeof photoId !== "string") {
+      return res.status(400).json({
+        message: "Invalid photo ID",
+      });
+    }
+
     // 3. Find photo
     const photo = await prisma.profilePhoto.findUnique({
       where: {
         id: photoId,
+      },
+      select: {
+        id: true,
+        userId: true,
+        storageKey: true,
       },
     });
 
@@ -298,47 +381,83 @@ export const deleteProfilePhoto = async (
       });
     }
 
-    // 5. Delete physical image
-    const filePath = path.join(
+    // 5. Delete database record only if ownership still matches
+    const deletedPhoto = await prisma.profilePhoto.deleteMany({
+      where: {
+        id: photoId,
+        userId,
+      },
+    });
+
+    if (deletedPhoto.count === 0) {
+      return res.status(404).json({
+        message: "Profile photo not found",
+      });
+    }
+
+    // 6. Delete physical image
+    const uploadDirectory = path.resolve(
       process.cwd(),
       "uploads",
       "profile-photos",
-      photo.storageKey,
     );
 
-    await unlink(filePath);
+    const filePath = path.resolve(
+      uploadDirectory,
+      path.basename(photo.storageKey),
+    );
 
-    // 6. Delete database record
-    await prisma.profilePhoto.delete({
-      where: {
-        id: photoId,
-      },
-    });
+    if (!filePath.startsWith(`${uploadDirectory}${path.sep}`)) {
+      console.error("Invalid profile photo storage path:", photo.storageKey);
+    } else {
+      try {
+        await unlink(filePath);
+      } catch (error) {
+        if (
+          !(
+            typeof error === "object" &&
+            error !== null &&
+            "code" in error &&
+            error.code === "ENOENT"
+          )
+        ) {
+          console.error("Profile photo file cleanup error:", error);
+        }
+      }
+    }
 
     // 7. Return success
     return res.status(200).json({
       message: "Profile photo deleted successfully",
     });
-
   } catch (error) {
     console.error("Delete profile photo error:", error);
 
     return res.status(500).json({
-      message: "Internal Server error",
+      message: "Internal server error",
     });
   }
 };
 
 
+// UPDATE PROFILE VISIBILITY
 export const updateProfileVisibility = async (
   req: Request,
   res: Response,
 ) => {
   try {
-    // 1. Get requested visibility
+    // 1. Validate authenticated user
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+      });
+    }
+
+    // 2. Validate requested visibility
     const { profileVisibility } = req.body;
 
-    // 2. Validate visibility
     if (
       profileVisibility !== "PUBLIC" &&
       profileVisibility !== "PRIVATE"
@@ -348,16 +467,7 @@ export const updateProfileVisibility = async (
       });
     }
 
-    // 3. Get authenticated user ID
-    const userId = req.user?.userId;
-
-    if (!userId) {
-      return res.status(401).json({
-        message: "Unauthorized",
-      });
-    }
-
-    // 4. Update profile visibility
+    // 3. Update profile visibility
     const user = await prisma.user.update({
       where: {
         id: userId,
@@ -373,7 +483,7 @@ export const updateProfileVisibility = async (
       },
     });
 
-    // 5. Return updated profile
+    // 4. Return updated profile
     return res.status(200).json({
       message: "Profile visibility updated successfully",
       user,
@@ -388,8 +498,13 @@ export const updateProfileVisibility = async (
 };
 
 
-export const getProfilePhoto = async (req: Request, res: Response) => {
+// GET SINGLE PROFILE PHOTO
+export const getProfilePhoto = async (
+  req: Request,
+  res: Response,
+) => {
   try {
+    // 1. Validate photo ID
     const photoId = req.params.photoId;
 
     if (typeof photoId !== "string") {
@@ -398,14 +513,16 @@ export const getProfilePhoto = async (req: Request, res: Response) => {
       });
     }
 
+    // 2. Retrieve photo and visibility information
     const photo = await prisma.profilePhoto.findFirst({
       where: {
         storageKey: photoId,
       },
-      include: {
+      select: {
+        userId: true,
+        storageKey: true,
         user: {
           select: {
-            id: true,
             profileVisibility: true,
           },
         },
@@ -418,6 +535,7 @@ export const getProfilePhoto = async (req: Request, res: Response) => {
       });
     }
 
+    // 3. Check profile visibility
     const userId = req.user?.userId;
 
     if (
@@ -429,14 +547,47 @@ export const getProfilePhoto = async (req: Request, res: Response) => {
       });
     }
 
-    const filePath = path.join(
+    // 4. Resolve safe file path
+    const uploadDirectory = path.resolve(
       process.cwd(),
       "uploads",
       "profile-photos",
-      photo.storageKey,
     );
 
-    return res.sendFile(filePath);
+    const filePath = path.resolve(
+      uploadDirectory,
+      path.basename(photo.storageKey),
+    );
+
+    if (!filePath.startsWith(`${uploadDirectory}${path.sep}`)) {
+      return res.status(400).json({
+        message: "Invalid photo path",
+      });
+    }
+
+    // 5. Send image asynchronously
+    return res.sendFile(filePath, (error) => {
+      if (error) {
+        if (!res.headersSent) {
+          if (
+            "code" in error &&
+            error.code === "ENOENT"
+          ) {
+            return res.status(404).json({
+              message: "Profile photo file not found",
+            });
+          }
+
+          console.error("Profile photo delivery error:", error);
+
+          return res.status(500).json({
+            message: "Unable to retrieve profile photo",
+          });
+        }
+
+        console.error("Profile photo delivery interrupted:", error);
+      }
+    });
   } catch (error) {
     console.error("Get profile photo error:", error);
 
@@ -445,4 +596,3 @@ export const getProfilePhoto = async (req: Request, res: Response) => {
     });
   }
 };
-

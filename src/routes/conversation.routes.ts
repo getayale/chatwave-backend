@@ -2,6 +2,7 @@
 import { Router } from "express";
 import {
   createConversation,
+  deleteConversation,
   getConversations,
   searchConversations,
 } from "../controllers/conversation.controller.js";
@@ -12,9 +13,13 @@ const conversationRouter = Router();
 conversationRouter.post("/", authenticateToken, createConversation);
 
 conversationRouter.get("/", authenticateToken, getConversations);
-conversationRouter.get(
-  "/search",
+
+conversationRouter.get("/search", authenticateToken, searchConversations);
+
+conversationRouter.delete(
+  "/:conversationId",
   authenticateToken,
-  searchConversations);
+  deleteConversation,
+);
 
 export default conversationRouter;

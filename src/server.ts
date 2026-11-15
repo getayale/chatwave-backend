@@ -7,6 +7,8 @@ import jwt from "jsonwebtoken";
 import app from "./app.js";
 import prisma from "./config/prisma.js";
 import { initializeSocket } from "./config/socket.js";
+import { connectRedis } from "./config/redis.js";
+
 import {
   addUserConnection,
   removeUserConnection,
@@ -226,8 +228,19 @@ io.on("connection", (socket) => {
   });
 });
 
-// 6. Start server
-httpServer.listen(PORT, () => {
-  console.log(`ChatWave API running on port ${PORT}`);
-  console.log("Socket.IO is ready");
-});
+// 6. Start server after connecting Redis
+const startServer = async () => {
+  try {
+    await connectRedis();
+
+    httpServer.listen(PORT, () => {
+      console.log(`ChatWave API running on port ${PORT}`);
+      console.log("Socket.IO is ready");
+    });
+  } catch (error) {
+    console.error("Failed to start ChatWave:", error);
+    process.exit(1);
+  }
+};
+
+void startServer();
